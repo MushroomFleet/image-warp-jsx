@@ -1,0 +1,1143 @@
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import * as THREE from 'three';
+
+// =============================================================================
+// ZEROBYTES: POSITION-IS-SEED IMAGE SELECTION
+// =============================================================================
+// The coordinate IS the seed - same position always selects same image
+// O(1) access, fully deterministic, parallelizable
+
+/**
+ * FNV-1a inspired hash for deterministic image selection
+ * Same inputs → same outputs across all machines and execution orders
+ */
+function positionHash(seed, ...coords) {
+  let hash = seed & 0xFFFFFFFF;
+  for (const coord of coords) {
+    hash ^= coord;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return Math.abs(hash);
+}
+
+function hashToIndex(hash, arrayLength) {
+  return hash % arrayLength;
+}
+
+function hashToFloat(hash) {
+  return (hash & 0xFFFFFFFF) / 0x100000000;
+}
+
+// =============================================================================
+// INDEXEDDB IMAGE STORAGE
+// =============================================================================
+
+const DB_NAME = 'ZeroImageWarpDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'images';
+
+// Resolution tiers in megapixels
+const RESOLUTION_TIERS = {
+  HIGH: 1.0,    // 1 megapixel - used when speed < 0.5
+  MEDIUM: 0.5,  // 0.5 megapixel - used when speed 0.5-1.5
+  LOW: 0.25,    // 0.25 megapixel - used when speed > 1.5
+};
+
+/**
+ * Initialize IndexedDB
+ */
+function openDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+        store.createIndex('name', 'name', { unique: false });
+      }
+    };
+  });
+}
+
+/**
+ * Store an image with all resolution variants
+ * @param {Object} imageData - { name, originalWidth, originalHeight, aspectRatio, high, medium, low }
+ */
+async function storeImage(imageData) {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.add(imageData);
+    
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+/**
+ * Get all stored images
+ */
+async function getAllImages() {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.getAll();
+    
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+/**
+ * Clear all stored images
+ */
+async function clearAllImages() {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.clear();
+    
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+/**
+ * Get image count
+ */
+async function getImageCount() {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.count();
+    
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// =============================================================================
+// IMAGE PROCESSING UTILITIES
+// =============================================================================
+
+/**
+ * Calculate dimensions that achieve target megapixels while preserving aspect ratio
+ */
+function scaleToMegapixels(originalWidth, originalHeight, targetMegapixels) {
+  const originalPixels = originalWidth * originalHeight;
+  const targetPixels = targetMegapixels * 1000000;
+  const scale = Math.sqrt(targetPixels / originalPixels);
+  
+  return {
+    width: Math.round(originalWidth * scale),
+    height: Math.round(originalHeight * scale)
+  };
+}
+
+/**
+ * Load an image file and return as HTMLImageElement
+ */
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error(`Failed to load image: ${file.name}`));
+    };
+    img.src = url;
+  });
+}
+
+/**
+ * Resize image and convert to WebP blob
+ */
+function resizeToWebP(img, targetWidth, targetHeight, quality = 0.85) {
+  return new Promise((resolve) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+    
+    canvas.toBlob(
+      (blob) => resolve(blob),
+      'image/webp',
+      quality
+    );
+  });
+}
+
+/**
+ * Convert blob to base64 data URL
+ */
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Process a single image into all resolution tiers
+ * Returns object with high, medium, low WebP data URLs
+ */
+async function processImage(file, onProgress) {
+  const img = await loadImageFromFile(file);
+  const { width: originalWidth, height: originalHeight } = img;
+  const aspectRatio = originalWidth / originalHeight;
+  
+  const result = {
+    name: file.name,
+    originalWidth,
+    originalHeight,
+    aspectRatio,
+    high: null,
+    medium: null,
+    low: null,
+  };
+  
+  // Process each resolution tier
+  for (const [tier, megapixels] of Object.entries(RESOLUTION_TIERS)) {
+    const { width, height } = scaleToMegapixels(originalWidth, originalHeight, megapixels);
+    const blob = await resizeToWebP(img, width, height);
+    const dataURL = await blobToDataURL(blob);
+    
+    result[tier.toLowerCase()] = {
+      dataURL,
+      width,
+      height,
+      megapixels,
+      sizeBytes: blob.size,
+    };
+    
+    if (onProgress) {
+      onProgress(`${file.name}: ${tier} (${width}×${height})`);
+    }
+  }
+  
+  return result;
+}
+
+// =============================================================================
+// PARTICLE COLOR THEMES
+// =============================================================================
+
+const PARTICLE_THEMES = [
+  { name: 'Teal', color: 0x00CED1 },
+  { name: 'Magenta', color: 0xFF00FF },
+  { name: 'Cyan', color: 0x00FFFF },
+  { name: 'Amber', color: 0xFFBF00 },
+  { name: 'Emerald', color: 0x50C878 },
+  { name: 'Coral', color: 0xFF7F50 },
+  { name: 'Violet', color: 0x8B00FF },
+  { name: 'Gold', color: 0xFFD700 },
+];
+
+// =============================================================================
+// MEGAPIXEL SELECTION UTILITIES
+// =============================================================================
+
+/**
+ * Get megapixel tier key based on current speed
+ */
+function getMegapixelTier(speed) {
+  if (speed < 0.5) return 'high';      // 1.0 MP when slow
+  if (speed > 1.5) return 'low';       // 0.25 MP when fast
+  return 'medium';                      // 0.5 MP normal
+}
+
+/**
+ * Get megapixel value for display
+ */
+function getMegapixelValue(speed) {
+  if (speed < 0.5) return 1.0;
+  if (speed > 1.5) return 0.25;
+  return 0.5;
+}
+
+/**
+ * Get billboard count based on speed (density)
+ */
+function getBillboardDensity(speed) {
+  if (speed < 0.5) return 15;
+  if (speed > 1.5) return 50;
+  return 30;
+}
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+const CONFIG = {
+  defaultSpeed: 1.0,
+  minSpeed: 0.1,
+  maxSpeed: 5.0,
+  spawnDistanceMin: -50,
+  spawnDistanceMax: -150,
+  forwardRecycleZ: 10,
+  backwardRecycleZ: -150,
+};
+
+// =============================================================================
+// TOAST NOTIFICATION COMPONENT
+// =============================================================================
+
+const Toast = ({ message, type, onClose }) => {
+  useEffect(() => {
+    const timer = setTimeout(onClose, 4000);
+    return () => clearTimeout(timer);
+  }, [onClose]);
+  
+  const bgColor = type === 'success' ? 'rgba(34, 197, 94, 0.9)' : 
+                  type === 'error' ? 'rgba(239, 68, 68, 0.9)' : 
+                  'rgba(59, 130, 246, 0.9)';
+  
+  return (
+    <div style={{
+      position: 'fixed',
+      top: 80,
+      right: 20,
+      backgroundColor: bgColor,
+      color: 'white',
+      padding: '12px 20px',
+      borderRadius: '8px',
+      fontFamily: 'system-ui, sans-serif',
+      fontSize: '14px',
+      zIndex: 2000,
+      boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+      animation: 'slideIn 0.3s ease-out',
+      maxWidth: '300px',
+    }}>
+      {message}
+    </div>
+  );
+};
+
+// =============================================================================
+// UPLOAD PANEL COMPONENT
+// =============================================================================
+
+const UploadPanel = ({ onImagesProcessed, imageCount, onClearImages }) => {
+  const [isDragging, setIsDragging] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processStatus, setProcessStatus] = useState('');
+  const [isExpanded, setIsExpanded] = useState(true);
+  const fileInputRef = useRef(null);
+  
+  const handleFiles = useCallback(async (files) => {
+    const imageFiles = Array.from(files).filter(f => 
+      f.type.startsWith('image/')
+    );
+    
+    if (imageFiles.length === 0) return;
+    
+    setIsProcessing(true);
+    setProcessStatus(`Processing 0/${imageFiles.length}...`);
+    
+    let processed = 0;
+    const results = [];
+    
+    for (const file of imageFiles) {
+      try {
+        const imageData = await processImage(file, (status) => {
+          setProcessStatus(status);
+        });
+        
+        await storeImage(imageData);
+        results.push(imageData);
+        processed++;
+        setProcessStatus(`Processed ${processed}/${imageFiles.length}`);
+      } catch (error) {
+        console.error(`Failed to process ${file.name}:`, error);
+      }
+    }
+    
+    setIsProcessing(false);
+    setProcessStatus('');
+    
+    if (results.length > 0) {
+      onImagesProcessed(results.length);
+    }
+  }, [onImagesProcessed]);
+  
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    handleFiles(e.dataTransfer.files);
+  }, [handleFiles]);
+  
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+  
+  const handleDragLeave = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+  }, []);
+  
+  const handleFileSelect = useCallback((e) => {
+    handleFiles(e.target.files);
+  }, [handleFiles]);
+  
+  const handleClear = useCallback(async () => {
+    await clearAllImages();
+    onClearImages();
+  }, [onClearImages]);
+  
+  return (
+    <div style={{
+      position: 'fixed',
+      top: 20,
+      left: 20,
+      backgroundColor: 'rgba(0, 0, 0, 0.85)',
+      borderRadius: '12px',
+      zIndex: 1000,
+      fontFamily: 'system-ui, sans-serif',
+      overflow: 'hidden',
+      width: isExpanded ? '280px' : '48px',
+      transition: 'width 0.3s ease',
+    }}>
+      {/* Header */}
+      <div 
+        onClick={() => setIsExpanded(!isExpanded)}
+        style={{
+          padding: '12px 16px',
+          borderBottom: isExpanded ? '1px solid rgba(255,255,255,0.1)' : 'none',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+        }}
+      >
+        <div style={{ 
+          display: 'flex', 
+          alignItems: 'center', 
+          gap: '8px',
+          color: 'white',
+        }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <circle cx="8.5" cy="8.5" r="1.5"/>
+            <polyline points="21 15 16 10 5 21"/>
+          </svg>
+          {isExpanded && <span style={{ fontWeight: 600 }}>Image Upload</span>}
+        </div>
+        {isExpanded && (
+          <span style={{ color: '#888', fontSize: '12px' }}>
+            {imageCount} image{imageCount !== 1 ? 's' : ''}
+          </span>
+        )}
+      </div>
+      
+      {isExpanded && (
+        <div style={{ padding: '16px' }}>
+          {/* Drop Zone */}
+          <div
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onClick={() => fileInputRef.current?.click()}
+            style={{
+              border: `2px dashed ${isDragging ? '#3b82f6' : 'rgba(255,255,255,0.3)'}`,
+              borderRadius: '8px',
+              padding: '24px 16px',
+              textAlign: 'center',
+              cursor: 'pointer',
+              backgroundColor: isDragging ? 'rgba(59, 130, 246, 0.1)' : 'transparent',
+              transition: 'all 0.2s ease',
+            }}
+          >
+            {isProcessing ? (
+              <div style={{ color: '#3b82f6' }}>
+                <div style={{ marginBottom: '8px' }}>Processing...</div>
+                <div style={{ fontSize: '12px', color: '#888' }}>{processStatus}</div>
+              </div>
+            ) : (
+              <>
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.5)" strokeWidth="2" style={{ margin: '0 auto 8px' }}>
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/>
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: '14px', marginBottom: '4px' }}>
+                  Drop images here
+                </div>
+                <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: '12px' }}>
+                  or click to browse
+                </div>
+              </>
+            )}
+          </div>
+          
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={handleFileSelect}
+            style={{ display: 'none' }}
+          />
+          
+          {/* Info */}
+          <div style={{ 
+            marginTop: '12px', 
+            fontSize: '11px', 
+            color: 'rgba(255,255,255,0.4)',
+            lineHeight: '1.4',
+          }}>
+            Images are automatically scaled to 0.25MP, 0.5MP, and 1MP WebP and stored locally.
+          </div>
+          
+          {/* Clear Button */}
+          {imageCount > 0 && (
+            <button
+              onClick={handleClear}
+              style={{
+                marginTop: '12px',
+                width: '100%',
+                padding: '8px',
+                backgroundColor: 'rgba(239, 68, 68, 0.2)',
+                border: '1px solid rgba(239, 68, 68, 0.5)',
+                borderRadius: '6px',
+                color: '#ef4444',
+                cursor: 'pointer',
+                fontSize: '12px',
+                fontWeight: 500,
+              }}
+            >
+              Clear All Images
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================================================
+// MAIN REACT COMPONENT
+// =============================================================================
+
+const ZeroImageWarp = () => {
+  const containerRef = useRef(null);
+  const sceneRef = useRef(null);
+  const rendererRef = useRef(null);
+  const cameraRef = useRef(null);
+  const billboardsRef = useRef([]);
+  const particlesRef = useRef(null);
+  
+  // Image data from IndexedDB
+  const [storedImages, setStoredImages] = useState([]);
+  const [imageCount, setImageCount] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  
+  // Toast notifications
+  const [toast, setToast] = useState(null);
+  
+  // Position-as-seed: Global seed determines entire universe
+  const seedRef = useRef(Math.floor(Math.random() * 0xFFFFFFFF));
+  const billboardIndexRef = useRef(0);
+  
+  // Speed control with smooth interpolation
+  const speedRef = useRef(CONFIG.defaultSpeed);
+  const targetSpeedRef = useRef(CONFIG.defaultSpeed);
+  const LERP_FACTOR = 0.05;
+  
+  // Direction control (true = forward/towards camera)
+  const directionForwardRef = useRef(true);
+  
+  // Particle theme cycling
+  const themeIndexRef = useRef(0);
+  
+  // Track target billboard count for density changes
+  const targetBillboardCountRef = useRef(30);
+  
+  // Texture cache for loaded images
+  const textureCacheRef = useRef(new Map());
+  
+  // UI State
+  const [uiState, setUiState] = useState({
+    speed: CONFIG.defaultSpeed,
+    direction: 'Forward',
+    theme: PARTICLE_THEMES[0].name,
+    megapixels: 0.5,
+    density: 30,
+  });
+
+  // Load images from IndexedDB on mount
+  useEffect(() => {
+    async function loadStoredImages() {
+      try {
+        const images = await getAllImages();
+        const count = await getImageCount();
+        setStoredImages(images);
+        setImageCount(count);
+      } catch (error) {
+        console.error('Failed to load stored images:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+    loadStoredImages();
+  }, []);
+
+  // Handle new images processed
+  const handleImagesProcessed = useCallback(async (newCount) => {
+    const images = await getAllImages();
+    const count = await getImageCount();
+    setStoredImages(images);
+    setImageCount(count);
+    
+    // Clear texture cache so new images are loaded
+    textureCacheRef.current.forEach(texture => texture.dispose());
+    textureCacheRef.current.clear();
+    
+    setToast({
+      message: `${newCount} image${newCount > 1 ? 's' : ''} processed and ready!`,
+      type: 'success'
+    });
+  }, []);
+
+  // Handle clear images
+  const handleClearImages = useCallback(() => {
+    setStoredImages([]);
+    setImageCount(0);
+    
+    // Clear texture cache
+    textureCacheRef.current.forEach(texture => texture.dispose());
+    textureCacheRef.current.clear();
+    
+    setToast({
+      message: 'All images cleared',
+      type: 'info'
+    });
+  }, []);
+
+  useEffect(() => {
+    if (isLoading) return;
+    
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    sceneRef.current = scene;
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(
+      75,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.z = 0;
+    cameraRef.current = camera;
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    containerRef.current.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+
+    // Texture loading from IndexedDB
+    const imageCache = textureCacheRef.current;
+    
+    function getOrCreateTexture(imageIndex, tier) {
+      if (storedImages.length === 0) return null;
+      
+      const actualIndex = imageIndex % storedImages.length;
+      const cacheKey = `${actualIndex}-${tier}`;
+      
+      if (!imageCache.has(cacheKey)) {
+        const imageData = storedImages[actualIndex];
+        const tierData = imageData[tier];
+        
+        if (!tierData || !tierData.dataURL) return null;
+        
+        const texture = new THREE.TextureLoader().load(tierData.dataURL);
+        texture.userData = {
+          originalWidth: imageData.originalWidth,
+          originalHeight: imageData.originalHeight,
+          scaledWidth: tierData.width,
+          scaledHeight: tierData.height,
+          aspectRatio: imageData.aspectRatio,
+          megapixels: tierData.megapixels,
+        };
+        
+        imageCache.set(cacheKey, texture);
+      }
+      
+      return imageCache.get(cacheKey);
+    }
+
+    // Keyboard controls
+    const handleKeyPress = (event) => {
+      if (event.key === '1') {
+        targetSpeedRef.current = Math.max(CONFIG.minSpeed, targetSpeedRef.current * 0.9);
+      } else if (event.key === '2') {
+        targetSpeedRef.current = CONFIG.defaultSpeed;
+      } else if (event.key === '3') {
+        targetSpeedRef.current = Math.min(CONFIG.maxSpeed, targetSpeedRef.current * 1.1);
+      } else if (event.key === '5') {
+        directionForwardRef.current = !directionForwardRef.current;
+      } else if (event.key === '4') {
+        themeIndexRef.current = (themeIndexRef.current + 1) % PARTICLE_THEMES.length;
+        if (particlesRef.current) {
+          particlesRef.current.material.color.setHex(PARTICLE_THEMES[themeIndexRef.current].color);
+        }
+      }
+    };
+    
+    window.addEventListener('keypress', handleKeyPress);
+
+    /**
+     * Create image billboard using position-as-seed methodology
+     */
+    const createBillboard = (index, currentSpeed, isForward) => {
+      if (storedImages.length === 0) return null;
+      
+      // ZEROBYTES: Position hash determines image selection
+      const imageHash = positionHash(seedRef.current, billboardIndexRef.current, 0);
+      const imageIndex = hashToIndex(imageHash, storedImages.length);
+      billboardIndexRef.current++;
+      
+      // Get megapixel tier based on current speed
+      const tier = getMegapixelTier(currentSpeed);
+      
+      // Get texture at appropriate resolution
+      const texture = getOrCreateTexture(imageIndex, tier);
+      if (!texture) return null;
+      
+      const aspectRatio = texture.userData.aspectRatio;
+      
+      // Calculate billboard size
+      const baseSize = 10 * (1 / Math.max(0.3, currentSpeed));
+      
+      let width, height;
+      if (aspectRatio >= 1) {
+        width = baseSize * Math.sqrt(aspectRatio);
+        height = baseSize / Math.sqrt(aspectRatio);
+      } else {
+        width = baseSize * Math.sqrt(aspectRatio);
+        height = baseSize / Math.sqrt(aspectRatio);
+      }
+      
+      // Create material
+      const opacity = 0.5 + hashToFloat(positionHash(seedRef.current, index, 1)) * 0.5;
+      const material = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        opacity: opacity,
+        side: THREE.DoubleSide
+      });
+      
+      // Create geometry
+      const geometry = new THREE.PlaneGeometry(width, height);
+      const billboard = new THREE.Mesh(geometry, material);
+      
+      // Position using deterministic hash
+      const angleHash = positionHash(seedRef.current, index, 2);
+      const radiusHash = positionHash(seedRef.current, index, 3);
+      
+      const angle = hashToFloat(angleHash) * Math.PI * 2;
+      const radius = 15 + hashToFloat(radiusHash) * 10;
+      
+      // Spawn position based on direction
+      let distance;
+      if (isForward) {
+        distance = CONFIG.spawnDistanceMin - hashToFloat(positionHash(seedRef.current, index, 4)) * 100;
+      } else {
+        distance = 5 + hashToFloat(positionHash(seedRef.current, index, 4)) * 15;
+      }
+      
+      billboard.position.x = Math.cos(angle) * radius;
+      billboard.position.y = Math.sin(angle) * radius - 5;
+      billboard.position.z = distance;
+      
+      billboard.lookAt(camera.position);
+      
+      billboard.userData = {
+        baseVelocity: 2 + hashToFloat(positionHash(seedRef.current, index, 5)),
+        initialZ: distance,
+        baseOpacity: opacity,
+        imageIndex: imageIndex,
+        currentTier: tier,
+      };
+      
+      scene.add(billboard);
+      return billboard;
+    };
+
+    // Create initial billboards (only if we have images)
+    if (storedImages.length > 0) {
+      const initialCount = getBillboardDensity(CONFIG.defaultSpeed);
+      targetBillboardCountRef.current = initialCount;
+      for (let i = 0; i < initialCount; i++) {
+        const billboard = createBillboard(i, CONFIG.defaultSpeed, true);
+        if (billboard) {
+          billboardsRef.current.push(billboard);
+        }
+      }
+    }
+
+    // Create particles
+    const particleCount = 1000;
+    const particleGeometry = new THREE.BufferGeometry();
+    const particlePositions = new Float32Array(particleCount * 3);
+    const particleVelocities = new Float32Array(particleCount);
+    const particleInitialZ = new Float32Array(particleCount);
+    
+    for (let i = 0; i < particleCount; i++) {
+      const i3 = i * 3;
+      const angleHash = positionHash(seedRef.current, i, 100);
+      const radiusHash = positionHash(seedRef.current, i, 101);
+      const depthHash = positionHash(seedRef.current, i, 102);
+      
+      const angle = hashToFloat(angleHash) * Math.PI * 2;
+      const radius = hashToFloat(radiusHash) * 30;
+      
+      particlePositions[i3] = Math.cos(angle) * radius;
+      particlePositions[i3 + 1] = Math.sin(angle) * radius - 5;
+      particlePositions[i3 + 2] = -hashToFloat(depthHash) * 200;
+      
+      particleVelocities[i] = 2 + hashToFloat(positionHash(seedRef.current, i, 103));
+      particleInitialZ[i] = particlePositions[i3 + 2];
+    }
+    
+    particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+    
+    const particleMaterial = new THREE.PointsMaterial({
+      color: PARTICLE_THEMES[0].color,
+      size: 0.2,
+      transparent: true,
+      opacity: 0.6,
+      blending: THREE.AdditiveBlending
+    });
+    
+    const particles = new THREE.Points(particleGeometry, particleMaterial);
+    particles.userData.velocities = particleVelocities;
+    particles.userData.initialZ = particleInitialZ;
+    particles.userData.activeCount = particleCount;
+    scene.add(particles);
+    particlesRef.current = particles;
+
+    // Animation loop
+    let frameCount = 0;
+    const animate = () => {
+      requestAnimationFrame(animate);
+      frameCount++;
+      
+      // Smooth lerp speed towards target
+      speedRef.current += (targetSpeedRef.current - speedRef.current) * LERP_FACTOR;
+      
+      const isForward = directionForwardRef.current;
+      const currentSpeed = speedRef.current;
+      const currentTier = getMegapixelTier(currentSpeed);
+      const currentMP = getMegapixelValue(currentSpeed);
+      const targetDensity = getBillboardDensity(currentSpeed);
+      
+      targetBillboardCountRef.current = targetDensity;
+      
+      // Update UI state periodically
+      if (frameCount % 10 === 0) {
+        setUiState({
+          speed: currentSpeed.toFixed(2),
+          direction: isForward ? 'Forward' : 'Reverse',
+          theme: PARTICLE_THEMES[themeIndexRef.current].name,
+          megapixels: currentMP,
+          density: targetDensity,
+        });
+      }
+      
+      // Only manage billboards if we have images
+      if (storedImages.length > 0) {
+        // Manage billboard density
+        const currentCount = billboardsRef.current.length;
+        if (currentCount < targetDensity) {
+          const toAdd = Math.min(2, targetDensity - currentCount);
+          for (let i = 0; i < toAdd; i++) {
+            const billboard = createBillboard(currentCount + i, currentSpeed, isForward);
+            if (billboard) {
+              billboardsRef.current.push(billboard);
+            }
+          }
+        } else if (currentCount > targetDensity) {
+          const toRemove = Math.min(2, currentCount - targetDensity);
+          for (let i = 0; i < toRemove; i++) {
+            const billboard = billboardsRef.current.shift();
+            if (billboard) {
+              scene.remove(billboard);
+              billboard.geometry.dispose();
+              billboard.material.dispose();
+            }
+          }
+        }
+        
+        // Update billboards
+        billboardsRef.current.forEach((billboard, index) => {
+          if (!billboard) return;
+          
+          billboard.lookAt(camera.position);
+          
+          if (isForward) {
+            billboard.position.z += billboard.userData.baseVelocity * currentSpeed;
+          } else {
+            billboard.position.z -= billboard.userData.baseVelocity * currentSpeed;
+          }
+          
+          // Fade when moving backward into distance
+          if (!isForward) {
+            const fadeStartDistance = -50;
+            const fadeEndDistance = -150;
+            
+            if (billboard.position.z < fadeStartDistance) {
+              const fadeProgress = Math.max(0, Math.min(1, 
+                (fadeStartDistance - billboard.position.z) / (fadeStartDistance - fadeEndDistance)
+              ));
+              billboard.material.opacity = billboard.userData.baseOpacity * (1 - fadeProgress);
+            } else {
+              billboard.material.opacity = billboard.userData.baseOpacity;
+            }
+          } else {
+            billboard.material.opacity = billboard.userData.baseOpacity;
+          }
+          
+          // Recycle billboard based on direction
+          const shouldRecycle = isForward ? 
+            (billboard.position.z > CONFIG.forwardRecycleZ) : 
+            (billboard.position.z < CONFIG.backwardRecycleZ);
+          
+          if (shouldRecycle) {
+            scene.remove(billboard);
+            billboard.geometry.dispose();
+            billboard.material.dispose();
+            
+            const newBillboard = createBillboard(index, currentSpeed, isForward);
+            if (newBillboard) {
+              billboardsRef.current[index] = newBillboard;
+            }
+          }
+        });
+      }
+      
+      // Dynamic particle count based on speed
+      const targetParticleCount = Math.floor(Math.min(1000, 100 + (currentSpeed * 900)));
+      particles.userData.activeCount = targetParticleCount;
+      
+      // Update particles
+      const positions = particles.geometry.attributes.position.array;
+      const velocities = particles.userData.velocities;
+      const initialZ = particles.userData.initialZ;
+      
+      for (let i = 0; i < particleCount; i++) {
+        const i3 = i * 3;
+        
+        if (i < particles.userData.activeCount) {
+          if (isForward) {
+            positions[i3 + 2] += velocities[i] * currentSpeed;
+            
+            if (positions[i3 + 2] > 10) {
+              positions[i3 + 2] = -200;
+              initialZ[i] = -200;
+            }
+          } else {
+            positions[i3 + 2] -= velocities[i] * currentSpeed;
+            
+            if (positions[i3 + 2] < -200) {
+              positions[i3 + 2] = 10;
+              initialZ[i] = 10;
+            }
+          }
+        } else {
+          positions[i3 + 2] = -10000;
+        }
+      }
+      
+      particles.geometry.attributes.position.needsUpdate = true;
+      
+      renderer.render(scene, camera);
+    };
+    
+    animate();
+
+    // Handle window resize
+    const handleResize = () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    };
+    
+    window.addEventListener('resize', handleResize);
+
+    // Cleanup
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('keypress', handleKeyPress);
+      
+      billboardsRef.current.forEach(billboard => {
+        if (billboard) {
+          scene.remove(billboard);
+          billboard.geometry.dispose();
+          billboard.material.dispose();
+        }
+      });
+      billboardsRef.current = [];
+      
+      scene.remove(particles);
+      particles.geometry.dispose();
+      particles.material.dispose();
+      
+      renderer.dispose();
+      if (containerRef.current && renderer.domElement) {
+        containerRef.current.removeChild(renderer.domElement);
+      }
+    };
+  }, [isLoading, storedImages]);
+
+  if (isLoading) {
+    return (
+      <div style={{
+        width: '100vw',
+        height: '100vh',
+        backgroundColor: '#000',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: 'white',
+        fontFamily: 'system-ui, sans-serif',
+      }}>
+        Loading...
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
+      {/* CSS Animation */}
+      <style>{`
+        @keyframes slideIn {
+          from { transform: translateX(100%); opacity: 0; }
+          to { transform: translateX(0); opacity: 1; }
+        }
+      `}</style>
+      
+      {/* Toast Notification */}
+      {toast && (
+        <Toast 
+          message={toast.message} 
+          type={toast.type} 
+          onClose={() => setToast(null)} 
+        />
+      )}
+      
+      {/* Upload Panel */}
+      <UploadPanel 
+        onImagesProcessed={handleImagesProcessed}
+        imageCount={imageCount}
+        onClearImages={handleClearImages}
+      />
+      
+      {/* Three.js container */}
+      <div
+        ref={containerRef}
+        style={{
+          width: '100%',
+          height: '100%',
+          margin: 0,
+          padding: 0,
+          overflow: 'hidden',
+          position: 'fixed',
+          top: 0,
+          left: 0
+        }}
+      />
+      
+      {/* No images prompt */}
+      {imageCount === 0 && (
+        <div style={{
+          position: 'fixed',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          color: 'rgba(255,255,255,0.5)',
+          fontFamily: 'system-ui, sans-serif',
+          textAlign: 'center',
+          pointerEvents: 'none',
+        }}>
+          <div style={{ fontSize: '24px', marginBottom: '8px' }}>No Images</div>
+          <div style={{ fontSize: '14px' }}>Upload images to start the warp tunnel</div>
+        </div>
+      )}
+      
+      {/* Controls overlay */}
+      <div style={{
+        position: 'fixed',
+        bottom: 20,
+        left: 20,
+        color: 'white',
+        fontFamily: 'monospace',
+        fontSize: '14px',
+        backgroundColor: 'rgba(0, 0, 0, 0.7)',
+        padding: '15px',
+        borderRadius: '8px',
+        zIndex: 1000,
+      }}>
+        <div style={{ marginBottom: '10px', fontWeight: 'bold', borderBottom: '1px solid #444', paddingBottom: '5px' }}>
+          ZERO IMAGE WARP
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr', gap: '5px' }}>
+          <span>Speed:</span><span>{uiState.speed}x</span>
+          <span>Direction:</span><span>{uiState.direction}</span>
+          <span>Theme:</span><span>{uiState.theme}</span>
+          <span>Resolution:</span><span>{uiState.megapixels} MP</span>
+          <span>Density:</span><span>{uiState.density} images</span>
+          <span>Library:</span><span>{imageCount} stored</span>
+        </div>
+        <div style={{ marginTop: '10px', fontSize: '12px', color: '#888', borderTop: '1px solid #444', paddingTop: '10px' }}>
+          <div><strong>Controls:</strong></div>
+          <div>[1] Slow down (-10%)</div>
+          <div>[2] Reset speed</div>
+          <div>[3] Speed up (+10%)</div>
+          <div>[4] Cycle theme</div>
+          <div>[5] Toggle direction</div>
+        </div>
+      </div>
+      
+      {/* Seed display */}
+      <div style={{
+        position: 'fixed',
+        bottom: 20,
+        right: 20,
+        color: '#666',
+        fontFamily: 'monospace',
+        fontSize: '12px',
+        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        padding: '8px',
+        borderRadius: '4px',
+        zIndex: 1000,
+      }}>
+        Seed: {seedRef.current?.toString(16).toUpperCase() || 'N/A'}
+      </div>
+    </div>
+  );
+};
+
+export default ZeroImageWarp;
